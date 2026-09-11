@@ -190,9 +190,19 @@ sysctl_set vm.vfs_cache_pressure=50
 sysctl_set vm.overcommit_memory=1
 sysctl_set vm.zone_reclaim_mode=1
 
-# 关闭透明大页与碎片整理
-echo never | $SUDO tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1 || true
-echo never | $SUDO tee /sys/kernel/mm/transparent_hugepage/defrag >/dev/null 2>&1 || true
+# 透明大页(THP)自适应策略（针对容器环境的关键差异化处理）：
+# - 显式大页可得时：关闭 THP，避免碎片化挤占 hugetlbfs 供给
+# - 显式大页不可得（容器受限，如本 ARM64 沙盒）时：切到 always 模式，
+#   让内核把 RandomX 的 2080MB 数据集自动折叠为 2MB 透明大页。
+#   注意：xmrig 自身不会调用 madvise(MADV_HUGEPAGE)，所以 madvise 模式对它无效，
+#   必须用 always 才能让数据集享受大页 TLB 红利（这是容器内唯一可行的"类大页"补偿）
+HP_AVAIL=$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)
+if [ "${HP_AVAIL:-0}" -gt 0 ] 2>/dev/null; then
+    echo never | $SUDO tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1 || true
+    echo never | $SUDO tee /sys/kernel/mm/transparent_hugepage/defrag >/dev/null 2>&1 || true
+else
+    echo always | $SUDO tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1 || true
+fi
 
 # 网络防假死
 sysctl_set net.ipv4.tcp_keepalive_time=30
@@ -274,6 +284,11 @@ echo "   -> 二进制就绪，来源: ${BIN_SRC:-pre-installed}"
 # ---------------- [4/6] 写入极限性能配置 + 4 重矿池容灾 ----------------
 echo "[4/6] 写入极限配置 (绑定 $CPU_COUNT 核心 / 大页 / 本地只读API / 4 重容灾)..."
 
+# 重要说明：max-threads-hint 是「百分比」不是「线程数」！
+#   100 = 使用 100% 核心（正确）。若误改为 2，含义是「只用 2% 的核心」，
+#   在未显式指定 rx 数组时会直接退化到单线程，切勿改动。
+#   本配置已用显式 rx 数组锁定线程，hint 仅作兜底。
+
 CPU_AFFINITY=""
 i=0
 while [ $i -lt "$CPU_COUNT" ]; do
@@ -284,6 +299,10 @@ while [ $i -lt "$CPU_COUNT" ]; do
     fi
     i=$((i + 1))
 done
+
+# 重要：max-threads-hint 是百分比（100 = 用满全部核心）。
+# 由于下方已用显式 rx 数组钉死 CPU 亲和性，这里保持 100 不影响准确性；
+# 若误设为 2 会被理解为「仅用 2% 核心」，在无 rx 数组时直接降级为单线程，切勿改。
 
 cat > "$WORK_DIR/config.json" << EOF
 {
@@ -546,6 +565,8 @@ sleep 10
 
 PROC_CNT=$(pgrep -x xmrig 2>/dev/null | wc -l)
 HP_NOW=$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo "?")
+THP_NOW=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | grep -o '\[.*\]' || echo "[未知]")
+NICE_NOW=$(ps -o ni= -p "$(pgrep -x xmrig 2>/dev/null | head -n1)" 2>/dev/null | tr -d ' ' || echo "?")
 XMRIG_VER=$("$WORK_DIR/xmrig" --version 2>/dev/null | head -n1 || echo "未知")
 
 echo "=================================================================="
@@ -556,9 +577,10 @@ echo "xmrig 版本           : $XMRIG_VER"
 echo "二进制来源           : ${BIN_SRC:-pre-installed}"
 echo "系统架构 (Arch)      : $ARCH_RAW ($ARCH_TAG)"
 echo "绑定线程 (Threads)   : $CPU_COUNT 个物理核心 (rx: [$CPU_AFFINITY])"
-echo "大页内存 (HugePages) : 当前 $HP_NOW 页 (容器受限时自动降级，不影响运行)"
+echo "显式大页 (HugePages) : 当前 $HP_NOW 页 (容器受限时自动降级，不影响运行)"
+echo "透明大页 (THP)       : $THP_NOW (显式大页不可用时自动切 always 补偿)"
+echo "进程优先级 (Nice)    : $NICE_NOW (容器无权限时保持默认，属正常)"
 echo "挖矿进程 (Process)   : ${PROC_CNT:-0} 个（由 daemon_loop 独占守护回收）"
-echo "调度级别             : nice -10（兼顾系统响应）"
 echo "容灾矩阵 (Pools)     : gulf:10004 > gulf:20004(TLS) > de:10004 > 纯IP直连"
 echo "本地算力API          : curl -s http://127.0.0.1:4680/2/summary"
 echo ""
